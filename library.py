@@ -1,33 +1,7 @@
-"""Library database set-up -- CMPT 354 mini project.
-
-Builds the database the application runs on: the twelve relations of section 3.5
-as SCHEMA_SQL, the sixteen triggers enforcing the business rules of section 1.3
-as TRIGGERS_SQL, and the seed data as DATA_SQL.
-
-    python library.py
-
-drops and recreates every table and trigger, then loads DATA_SQL.
-
-The user-facing operations live in user.py, which imports connect() and
-is_initialised() from here.  Nothing in this module imports user.py, so the
-dependency runs one way only.
-
-Integrity is the database's job.  Every business rule from section 1.3 is a CHECK
-constraint or a trigger below, never a check written in Python, because a second
-copy of a rule is a copy that drifts.
-"""
-
 import sqlite3
 from contextlib import closing
 
 DB_NAME = "library.db"
-
-
-class LibraryError(Exception):
-    """A request that cannot be carried out for a reason SQLite has no
-    constraint for: an unknown member, no head librarian on file, and so on.
-    Business rules are never raised from here -- the triggers raise those."""
-
 
 # ---------------------------------------------------------------------------
 # Schema: reflect relations in final schema 3.5

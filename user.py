@@ -29,7 +29,18 @@ import os
 import sqlite3
 from datetime import date
 
-from library import DB_NAME, LibraryError, connect, is_initialised
+from library import DB_NAME, connect, is_initialised
+
+
+class LibraryError(Exception):
+    """A request that cannot be carried out for a reason SQLite has no
+    constraint for: an unknown member, no head librarian on file, and so on.
+    Business rules are never raised from here -- the triggers raise those, and
+    they arrive as sqlite3.Error carrying the trigger's own message.
+
+    It lives in this module because this is the only layer that raises it.
+    library.py builds the schema and runs SQL; anything that goes wrong there is
+    already a sqlite3.Error worth reading as-is."""
 
 
 # ---------------------------------------------------------------------------
