@@ -1,30 +1,3 @@
-"""Library application -- CMPT 354 mini project.
-
-The eight operations a library user needs: find an item, borrow it, return it,
-donate one, find an event, register for it, volunteer, and ask a librarian for
-help.
-
-    python user.py
-
-opens the menu.  The database must already exist -- run `python library.py`
-first; this module never creates schema.
-
-Two of the eight operations have no table behind them -- the report's section
-1.2 never describes volunteering or help requests -- so they are mapped onto the
-existing schema.  The mappings are lossy, and knowingly so:
-
-  * volunteer()     inserts an Employee row with job_title 'Volunteer - <role>'
-                    and salary 0.  Consequences: staff counts, payroll sums and
-                    supervision queries include volunteers unless they filter
-                    job_title NOT LIKE 'Volunteer%'; and since Employee has no
-                    member_id there is no reliable link back to the member who
-                    volunteered -- this module matches on name plus phone, which
-                    is not a key and can collide.
-
-  * ask_librarian() does not persist anything.  It returns the librarians on
-                    duty; the question is lost when the process exits.
-"""
-
 import os
 import sqlite3
 from datetime import date
@@ -35,34 +8,27 @@ from library import DB_NAME, connect, is_initialised
 class LibraryError(Exception):
     """A request that cannot be carried out for a reason SQLite has no
     constraint for: an unknown member, no head librarian on file, and so on.
-    Business rules are never raised from here -- the triggers raise those, and
-    they arrive as sqlite3.Error carrying the trigger's own message.
-
-    It lives in this module because this is the only layer that raises it.
-    library.py builds the schema and runs SQL; anything that goes wrong there is
-    already a sqlite3.Error worth reading as-is."""
+    It lives in this module because this is the only layer that raises it."""
 
 
-# ---------------------------------------------------------------------------
-# Item Type used to derive due date. 
-# ---------------------------------------------------------------------------
-
-_LOAN_JOIN = """
-      FROM Loan l
-      JOIN Item i     ON i.item_id   = l.item_id
-      JOIN ItemType t ON t.type_code = i.type_code
+# Loans with their due date derived from the item type's loan period, so the
+# queries below can select due_date by name instead of repeating the date
+# arithmetic every time they need it.
+_LOANS = """
+    (SELECT l.loan_id, l.item_id, l.copy_number, l.member_id, i.title,
+            l.checkout_date, l.return_date,
+            date(l.checkout_date, '+' || t.loan_period || ' days') AS due_date
+       FROM Loan l
+       JOIN Item i     ON i.item_id   = l.item_id
+       JOIN ItemType t ON t.type_code = i.type_code)
 """
-
-_DUE_DATE = "date(l.checkout_date, '+' || t.loan_period || ' days')"
 
 
 def _today():
     return date.today().isoformat()
 
 
-# ---------------------------------------------------------------------------
-# 1. Allow user to find an item in the library
-# ---------------------------------------------------------------------------
+# --- 1. Find an item in the library ------------------------------------------
 
 def find_items(conn, keyword=""):
     """Items whose title or creator matches, with how many copies are free."""
@@ -70,84 +36,78 @@ def find_items(conn, keyword=""):
     return conn.execute("""
         SELECT i.item_id, i.title, i.creator, i.published_year, i.language,
                t.type_name, t.loan_period, t.daily_fine_rate,
-               (SELECT count(*) FROM Copy c
-                 WHERE c.item_id = i.item_id) AS total_copies,
-               (SELECT count(*) FROM Copy c
-                 WHERE c.item_id = i.item_id
-                   AND c.copy_status = 'available') AS available_copies
+               count(c.copy_number) AS total_copies,
+               count(CASE WHEN c.copy_status = 'available' THEN 1 END)
+                   AS available_copies
           FROM Item i
-          JOIN ItemType t ON t.type_code = i.type_code
+          JOIN ItemType t  ON t.type_code = i.type_code
+          LEFT JOIN Copy c ON c.item_id   = i.item_id
          WHERE i.title LIKE ? OR ifnull(i.creator, '') LIKE ?
+         GROUP BY i.item_id
          ORDER BY i.title
     """, (pattern, pattern)).fetchall()
 
+
 def find_available_copies(conn, item_id):
-    """Copies of an item that are free to borrow right now."""
+    """Copies of an item that are free to borrow right now.  copy_status is the
+    whole answer: the SetCopyLoaned and SetCopyAvailable triggers keep it in
+    step with Loan, and the BR6 trigger reads that same column."""
     return conn.execute("""
-        SELECT c.item_id, c.copy_number, c.acquisition_date, c.copy_status
-          FROM Copy c
-         WHERE c.item_id = ?
-           AND c.copy_status = 'available'
-           AND NOT EXISTS (SELECT 1 FROM Loan l
-                            WHERE l.item_id     = c.item_id
-                              AND l.copy_number = c.copy_number
-                              AND l.return_date IS NULL)
-         ORDER BY c.copy_number
+        SELECT item_id, copy_number, acquisition_date, copy_status
+          FROM Copy
+         WHERE item_id = ? AND copy_status = 'available'
+         ORDER BY copy_number
     """, (item_id,)).fetchall()
 
-# ---------------------------------------------------------------------------
-# 2. Borrow an item from the library
-# ---------------------------------------------------------------------------
+
+# --- 2. Borrow an item from the library --------------------------------------
 
 def borrow_item(conn, member_id, item_id, copy_number, checkout_date=None):
     """Check a copy out.  Returns (loan_id, due_date).
 
     BR6 (copy free), BR10 (five-loan cap) and BR11 (not suspended) are enforced
-    by triggers; a violation surfaces as sqlite3.IntegrityError carrying the
-    trigger's own message.
-    """
+    by triggers; a violation surfaces as sqlite3.IntegrityError."""
     checkout_date = checkout_date or _today()
     with conn:
         cur = conn.execute("""
             INSERT INTO Loan (item_id, copy_number, member_id, checkout_date)
             VALUES (?, ?, ?, ?)
         """, (item_id, copy_number, member_id, checkout_date))
-        loan_id = cur.lastrowid
-    return loan_id, due_date_of(conn, loan_id)
+    return cur.lastrowid, due_date_of(conn, cur.lastrowid)
 
 
 def due_date_of(conn, loan_id):
     """The derived due date of a loan: checkout date plus the type's period."""
     row = conn.execute(
-        "SELECT " + _DUE_DATE + " AS due_date" + _LOAN_JOIN +
-        " WHERE l.loan_id = ?", (loan_id,)).fetchone()
+        "SELECT due_date FROM " + _LOANS + " WHERE loan_id = ?",
+        (loan_id,)).fetchone()
     if row is None:
         raise LibraryError("There is no loan with id %s." % loan_id)
     return row["due_date"]
 
 
 def outstanding_loans(conn, member_id):
-    """A member's un-returned loans, with derived due dates and days overdue."""
-    return conn.execute(
-        "SELECT l.loan_id, l.item_id, l.copy_number, i.title,"
-        "       l.checkout_date, " + _DUE_DATE + " AS due_date,"
-        "       CAST(julianday('now') - julianday(" + _DUE_DATE +
-        "            ) AS integer) AS days_overdue" + _LOAN_JOIN +
-        " WHERE l.member_id = ? AND l.return_date IS NULL"
-        " ORDER BY due_date", (member_id,)).fetchall()
+    """A member's un-returned loans, with derived due dates and days overdue.
+
+    days_overdue is negative for a loan that is not due yet."""
+    return conn.execute("""
+        SELECT loan_id, item_id, copy_number, title, checkout_date, due_date,
+               CAST(julianday('now') - julianday(due_date) AS integer)
+                   AS days_overdue
+          FROM """ + _LOANS + """
+         WHERE member_id = ? AND return_date IS NULL
+         ORDER BY due_date
+    """, (member_id,)).fetchall()
 
 
-# ---------------------------------------------------------------------------
-# 3. Return a borrowed item
-# ---------------------------------------------------------------------------
+# --- 3. Return a borrowed item -----------------------------------------------
 
 def return_item(conn, loan_id, return_date=None):
     """Return a copy.  Returns (due_date, days_overdue, fine_amount_or_None).
 
-    The BR13 trigger refuses a fine on a loan that was not late and computes the
-    amount itself, so this only decides whether to create the Fine row at all
-    and then reads back what the trigger worked out.
-    """
+    The BR13 trigger refuses a fine on a loan that was not late and works out
+    the amount itself, so this only decides whether to create the Fine row at
+    all and then reads back what the trigger computed."""
     return_date = return_date or _today()
     with conn:
         cur = conn.execute(
@@ -157,11 +117,13 @@ def return_item(conn, loan_id, return_date=None):
             raise LibraryError(
                 "Loan %s does not exist or has already been returned." % loan_id)
 
-        row = conn.execute(
-            "SELECT " + _DUE_DATE + " AS due_date,"
-            "       CAST(julianday(l.return_date) - julianday(" + _DUE_DATE +
-            "            ) AS integer) AS days_overdue" + _LOAN_JOIN +
-            " WHERE l.loan_id = ?", (loan_id,)).fetchone()
+        row = conn.execute("""
+            SELECT due_date,
+                   CAST(julianday(return_date) - julianday(due_date) AS integer)
+                       AS days_overdue
+              FROM """ + _LOANS + """
+             WHERE loan_id = ?
+        """, (loan_id,)).fetchone()
 
         fine = None
         if row["days_overdue"] > 0:
@@ -175,47 +137,41 @@ def return_item(conn, loan_id, return_date=None):
     return row["due_date"], row["days_overdue"], fine
 
 
-# ---------------------------------------------------------------------------
-# 4. Donate an item to the library
-# ---------------------------------------------------------------------------
+# --- 4. Donate an item to the library ----------------------------------------
 
 def donate_item(conn, member_id, title, type_code, creator=None,
                 published_year=None, language=None, donated_date=None):
     """Accept a donated item.  Returns (item_id, copy_number).
 
     Copy.acquisition_method and Copy.donated_by record how the copy arrived and
-    who gave it, so the donation needs no stand-in row elsewhere.  Both inserts
-    are one transaction -- a failure leaves nothing.
-    """
+    who gave it, so the donation needs no stand-in row elsewhere.  It is
+    catalogued as a new item, so its copy is always copy 1, and both inserts are
+    one transaction -- a failure leaves nothing behind."""
     donated_date = donated_date or _today()
 
-    known = conn.execute(
-        "SELECT 1 FROM ItemType WHERE type_code = ?", (type_code,)).fetchone()
-    if known is None:
-        raise LibraryError(
-            "There is no item type '%s'.  Known types: %s" %
-            (type_code, ", ".join(r["type_code"] for r in
-                                  conn.execute("SELECT type_code FROM ItemType"))))
+    if conn.execute("SELECT 1 FROM ItemType WHERE type_code = ?",
+                    (type_code,)).fetchone() is None:
+        known = ", ".join(r["type_code"] for r in
+                          conn.execute("SELECT type_code FROM ItemType"))
+        raise LibraryError("There is no item type '%s'.  Known types: %s"
+                           % (type_code, known))
 
     with conn:
         cur = conn.execute("""
             INSERT INTO Item (title, creator, published_year, language, type_code)
             VALUES (?, ?, ?, ?, ?)
         """, (title, creator, published_year, language, type_code))
-        item_id = cur.lastrowid
 
         conn.execute("""
             INSERT INTO Copy (item_id, copy_number, acquisition_date,
                               acquisition_method, donated_by, copy_status)
             VALUES (?, 1, ?, 'donation', ?, 'available')
-        """, (item_id, donated_date, member_id))
+        """, (cur.lastrowid, donated_date, member_id))
 
-    return item_id, 1
+    return cur.lastrowid, 1
 
 
-# ---------------------------------------------------------------------------
-# 5. Find an event in the library
-# ---------------------------------------------------------------------------
+# --- 5. Find an event in the library -----------------------------------------
 
 def find_events(conn, keyword=None, upcoming_only=True):
     """Events matching a keyword, with seats left."""
@@ -224,22 +180,20 @@ def find_events(conn, keyword=None, upcoming_only=True):
         SELECT e.event_id, e.title, e.event_category, e.audience_category,
                e.start_datetime, e.end_datetime, e.max_attendees,
                e.room_number, r.capacity,
-               (SELECT count(*) FROM Registration g
-                 WHERE g.event_id = e.event_id) AS registered,
-               e.max_attendees - (SELECT count(*) FROM Registration g
-                                   WHERE g.event_id = e.event_id) AS seats_left
+               count(g.member_id) AS registered,
+               e.max_attendees - count(g.member_id) AS seats_left
           FROM Event e
-          JOIN Room r ON r.room_number = e.room_number
+          JOIN Room r              ON r.room_number = e.room_number
+          LEFT JOIN Registration g ON g.event_id    = e.event_id
          WHERE (e.title LIKE ? OR e.event_category LIKE ?
                 OR e.audience_category LIKE ?)
            AND (? = 0 OR e.start_datetime >= datetime('now'))
+         GROUP BY e.event_id
          ORDER BY e.start_datetime
     """, (pattern, pattern, pattern, 1 if upcoming_only else 0)).fetchall()
 
 
-# ---------------------------------------------------------------------------
-# 6. Register for an event
-# ---------------------------------------------------------------------------
+# --- 6. Register for an event ------------------------------------------------
 
 def register_for_event(conn, member_id, event_id, registration_date=None):
     """Register a member.  BR11 (not suspended) and BR18 (capacity) are trigger
@@ -253,16 +207,13 @@ def register_for_event(conn, member_id, event_id, registration_date=None):
     return member_id, event_id
 
 
-# ---------------------------------------------------------------------------
-# 7. Volunteer for the library
-# ---------------------------------------------------------------------------
+# --- 7. Volunteer for the library --------------------------------------------
 
 def volunteer(conn, member_id, role="General"):
     """Sign a member up as a volunteer.  Returns the new employee_id.
 
-    See the module docstring: volunteers are stored as Employee rows, which is
-    the only staff-shaped table in the schema.
-    """
+    Volunteers are stored as Employee rows (see the module docstring), and the
+    job title marks them as volunteers rather than paid staff."""
     member = conn.execute("""
         SELECT first_name, last_name, phone FROM Member WHERE member_id = ?
     """, (member_id,)).fetchone()
@@ -278,15 +229,16 @@ def volunteer(conn, member_id, role="General"):
             "No head librarian is on file yet, so a volunteer has nobody to "
             "report to.  Add the head librarian before signing up volunteers.")
 
+    # Employee has no member_id, so name and phone are the only link back.
     already = conn.execute("""
         SELECT employee_id FROM Employee
          WHERE first_name = ? AND last_name = ? AND phone = ?
            AND job_title LIKE 'Volunteer%'
     """, (member["first_name"], member["last_name"], member["phone"])).fetchone()
     if already is not None:
-        raise LibraryError(
-            "%s %s already volunteers here (employee %s)." %
-            (member["first_name"], member["last_name"], already["employee_id"]))
+        raise LibraryError("%s %s already volunteers here (employee %s)."
+                           % (member["first_name"], member["last_name"],
+                              already["employee_id"]))
 
     with conn:
         cur = conn.execute("""
@@ -298,16 +250,11 @@ def volunteer(conn, member_id, role="General"):
     return cur.lastrowid
 
 
-# ---------------------------------------------------------------------------
-# 8. Ask for help from a librarian
-# ---------------------------------------------------------------------------
+# --- 8. Ask for help from a librarian ----------------------------------------
 
 def ask_librarian(conn, question=""):
-    """Return the librarians who can help.
-
-    See the module docstring: there is no relation for help requests, so the
-    question itself is not stored anywhere.
-    """
+    """The librarians who can help.  The question is not stored: the schema has
+    no relation for help requests (see the module docstring)."""
     return conn.execute("""
         SELECT employee_id, first_name, last_name, job_title, phone
           FROM Employee
@@ -317,22 +264,7 @@ def ask_librarian(conn, question=""):
     """).fetchall()
 
 
-# ---------------------------------------------------------------------------
-# Command line interface
-# ---------------------------------------------------------------------------
-
-MENU = """
-  1. Find an item in the library
-  2. Borrow an item from the library
-  3. Return a borrowed item
-  4. Donate an item to the library
-  5. Find an event in the library
-  6. Register for an event in the library
-  7. Volunteer for the library
-  8. Ask for help from a librarian
-  0. Quit
-"""
-
+# --- Command line interface --------------------------------------------------
 
 def _show(rows, columns=None):
     """Print rows as an aligned table."""
@@ -341,11 +273,16 @@ def _show(rows, columns=None):
         print("  (nothing found)")
         return
     columns = columns or rows[0].keys()
-    widths = [max(len(str(c)), max(len(str(r[c])) for r in rows)) for c in columns]
-    print("  " + "  ".join(str(c).ljust(w) for c, w in zip(columns, widths)))
-    print("  " + "  ".join("-" * w for w in widths))
+    widths = [max(len(str(c)), max(len(str(r[c])) for r in rows))
+              for c in columns]
+
+    def line(values):
+        return "  " + "  ".join(str(v).ljust(w) for v, w in zip(values, widths))
+
+    print(line(columns))
+    print(line("-" * w for w in widths))
     for r in rows:
-        print("  " + "  ".join(str(r[c]).ljust(w) for c, w in zip(columns, widths)))
+        print(line(r[c] for c in columns))
 
 
 def _ask(prompt, cast=str, optional=False):
@@ -358,7 +295,8 @@ def _ask(prompt, cast=str, optional=False):
 
 
 def _do_find_item(conn):
-    _show(find_items(conn, _ask("  Title or creator: ", optional=True) or ""),
+    keyword = _ask("  Title or creator: ", optional=True) or ""
+    _show(find_items(conn, keyword),
           ["item_id", "title", "creator", "type_name",
            "total_copies", "available_copies"])
 
@@ -437,51 +375,53 @@ def _do_ask_librarian(conn):
           " relation for help requests.)")
 
 
-ACTIONS = {
-    "1": _do_find_item,
-    "2": _do_borrow,
-    "3": _do_return,
-    "4": _do_donate,
-    "5": _do_find_event,
-    "6": _do_register,
-    "7": _do_volunteer,
-    "8": _do_ask_librarian,
-}
+# The menu is printed from this list, so the numbering has one source.
+ACTIONS = [
+    ("Find an item in the library", _do_find_item),
+    ("Borrow an item from the library", _do_borrow),
+    ("Return a borrowed item", _do_return),
+    ("Donate an item to the library", _do_donate),
+    ("Find an event in the library", _do_find_event),
+    ("Register for an event in the library", _do_register),
+    ("Volunteer for the library", _do_volunteer),
+    ("Ask for help from a librarian", _do_ask_librarian),
+]
 
 
-def _not_set_up():
+def _open_database():
+    """The connection, or None if the database is not set up yet."""
+    # Check the file exists before connecting: sqlite3.connect() would create an
+    # empty database as a side effect, leaving a stray file behind on refusal.
+    conn = connect() if os.path.exists(DB_NAME) else None
+    if conn is not None and is_initialised(conn):
+        return conn
+    if conn is not None:
+        conn.close()
     print("Database is not set up yet.")
     print("Run `python library.py` to create the schema, triggers and "
           "data, then try again.")
+    return None
 
 
 def main():
-    # Check the file exists before connecting: sqlite3.connect() would create an
-    # empty database as a side effect, leaving a stray file behind on refusal.
-    if not os.path.exists(DB_NAME):
-        _not_set_up()
-        return
-    conn = connect()
-    if not is_initialised(conn):
-        conn.close()
-        _not_set_up()
+    conn = _open_database()
+    if conn is None:
         return
 
     print("\nLibrary database application.")
     while True:
-        print(MENU)
+        print()
+        for number, (label, _) in enumerate(ACTIONS, 1):
+            print("  %s. %s" % (number, label))
+        print("  0. Quit\n")
         try:
             choice = input("  Choose an option: ").strip()
-        except EOFError:
-            break
-        if choice == "0":
-            break
-        action = ACTIONS.get(choice)
-        if action is None:
-            print("  '%s' is not one of the options." % choice)
-            continue
-        try:
-            action(conn)
+            if choice == "0":
+                break
+            if not choice.isdigit() or not 1 <= int(choice) <= len(ACTIONS):
+                print("  '%s' is not one of the options." % choice)
+                continue
+            ACTIONS[int(choice) - 1][1](conn)
         except (sqlite3.Error, LibraryError) as err:
             # The triggers raise messages that already read as sentences
             # ("BR10: a member may have at most five items on loan at once"),
