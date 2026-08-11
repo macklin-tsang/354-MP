@@ -6,126 +6,106 @@ from library import DB_NAME, connect, is_initialised
 
 
 class LibraryError(Exception):
-    """A request that cannot be carried out for a reason SQLite has no
-    constraint for: an unknown member, no head librarian on file, and so on.
-    It lives in this module because this is the only layer that raises it."""
+    """Error Handling For Cases Beyond SQLite/DB"""
 
 
-# Loans with their due date derived from the item type's loan period, so the
-# queries below can select due_date by name instead of repeating the date
-# arithmetic every time they need it.
+# Loans with due date derived from the item type's loan period, so the
+# queries below can select due_date by name
 _LOANS = """
-    (SELECT l.loan_id, l.item_id, l.copy_number, l.member_id, i.title,
-            l.checkout_date, l.return_date,
+    (SELECT l.loan_id, l.item_id, l.copy_number, l.member_id, i.title, l.checkout_date, l.return_date,
             date(l.checkout_date, '+' || t.loan_period || ' days') AS due_date
        FROM Loan l
        JOIN Item i     ON i.item_id   = l.item_id
        JOIN ItemType t ON t.type_code = i.type_code)
 """
 
-
-def _today():
+def today():
     return date.today().isoformat()
 
-
-# --- 1. Find an item in the library ------------------------------------------
+# (1) Find Items
 
 def find_items(conn, keyword=""):
-    """Items whose title or creator matches, with how many copies are free."""
-    pattern = "%" + keyword + "%"
+    # A NULL creator fails LIKE on its own, so ifnull() would add nothing.
     return conn.execute("""
         SELECT i.item_id, i.title, i.creator, i.published_year, i.language,
-               t.type_name, t.loan_period, t.daily_fine_rate,
+               it.type_name, it.loan_period, it.daily_fine_rate,
                count(c.copy_number) AS total_copies,
-               count(CASE WHEN c.copy_status = 'available' THEN 1 END)
-                   AS available_copies
+               count(*) FILTER (WHERE c.copy_status = 'available') AS available_copies
           FROM Item i
-          JOIN ItemType t  ON t.type_code = i.type_code
-          LEFT JOIN Copy c ON c.item_id   = i.item_id
-         WHERE i.title LIKE ? OR ifnull(i.creator, '') LIKE ?
+          JOIN ItemType it ON it.type_code = i.type_code
+          LEFT JOIN Copy c ON c.item_id    = i.item_id
+         WHERE i.title LIKE :keyword OR i.creator LIKE :keyword
          GROUP BY i.item_id
          ORDER BY i.title
-    """, (pattern, pattern)).fetchall()
+    """, {"keyword": "%" + keyword + "%"}).fetchall()
 
 
 def find_available_copies(conn, item_id):
-    """Copies of an item that are free to borrow right now.  copy_status is the
-    whole answer: the SetCopyLoaned and SetCopyAvailable triggers keep it in
-    step with Loan, and the BR6 trigger reads that same column."""
+    # Retrieving item_id on copies with available status
     return conn.execute("""
         SELECT item_id, copy_number, acquisition_date, copy_status
-          FROM Copy
-         WHERE item_id = ? AND copy_status = 'available'
+         FROM Copy WHERE item_id = ? AND copy_status = 'available'
          ORDER BY copy_number
     """, (item_id,)).fetchall()
 
-
-# --- 2. Borrow an item from the library --------------------------------------
+# (2) Borrow Items
 
 def borrow_item(conn, member_id, item_id, copy_number, checkout_date=None):
-    """Check a copy out.  Returns (loan_id, due_date).
-
-    BR6 (copy free), BR10 (five-loan cap) and BR11 (not suspended) are enforced
-    by triggers; a violation surfaces as sqlite3.IntegrityError."""
-    checkout_date = checkout_date or _today()
+    # Borrowing item, returns loan_id and due_date
+    checkout_date = checkout_date or today()
     with conn:
         cur = conn.execute("""
             INSERT INTO Loan (item_id, copy_number, member_id, checkout_date)
             VALUES (?, ?, ?, ?)
         """, (item_id, copy_number, member_id, checkout_date))
-    return cur.lastrowid, due_date_of(conn, cur.lastrowid)
+    loan_id = cur.lastrowid
+    return loan_id, due_date(conn, loan_id)
 
 
-def due_date_of(conn, loan_id):
-    """The derived due date of a loan: checkout date plus the type's period."""
+def due_date(conn, loan_id):
+    # Due date: check out date + loan period for item type
     row = conn.execute(
-        "SELECT due_date FROM " + _LOANS + " WHERE loan_id = ?",
-        (loan_id,)).fetchone()
+        "SELECT due_date FROM " + _LOANS + " WHERE loan_id = ?", (loan_id,)).fetchone()
     if row is None:
-        raise LibraryError("There is no loan with id %s." % loan_id)
+        raise LibraryError(f"Loan not found with id: {loan_id}.")
     return row["due_date"]
 
-
 def outstanding_loans(conn, member_id):
-    """A member's un-returned loans, with derived due dates and days overdue.
-
-    days_overdue is negative for a loan that is not due yet."""
+    # Loans past expiry date, returns member_id
     return conn.execute("""
         SELECT loan_id, item_id, copy_number, title, checkout_date, due_date,
-               CAST(julianday('now') - julianday(due_date) AS integer)
-                   AS days_overdue
-          FROM """ + _LOANS + """
-         WHERE member_id = ? AND return_date IS NULL
+               CAST(julianday(:today) - julianday(due_date) AS integer) AS days_overdue
+         FROM """ + _LOANS + """
+         WHERE member_id = :member_id AND return_date IS NULL
          ORDER BY due_date
-    """, (member_id,)).fetchall()
+    """, {"today": today(), "member_id": member_id}).fetchall()
 
+# (3) Return Item
 
-# --- 3. Return a borrowed item -----------------------------------------------
-
-def return_item(conn, loan_id, return_date=None):
-    """Return a copy.  Returns (due_date, days_overdue, fine_amount_or_None).
-
-    The BR13 trigger refuses a fine on a loan that was not late and works out
-    the amount itself, so this only decides whether to create the Fine row at
-    all and then reads back what the trigger computed."""
-    return_date = return_date or _today()
+def return_item(conn, loan_id, return_date=None, member_id=None):
+    # Return item .. function returns (due_date, days_overdue, fine_amount_or_None).
+    return_date = return_date or today()
     with conn:
-        cur = conn.execute(
-            "UPDATE Loan SET return_date = ? WHERE loan_id = ? "
-            "AND return_date IS NULL", (return_date, loan_id))
+        cur = conn.execute("""
+            UPDATE Loan SET return_date = ?
+             WHERE loan_id = ? AND return_date IS NULL
+               AND (? IS NULL OR member_id = ?)
+        """, (return_date, loan_id, member_id, member_id))
         if cur.rowcount == 0:
+            if member_id is None:
+                raise LibraryError(f"Loan {loan_id} does not exist or has already been returned")
             raise LibraryError(
-                "Loan %s does not exist or has already been returned." % loan_id)
+                f"""Loan {loan_id} does not exist, has already been returned, or is not 
+                on loan to member {member_id}""")
 
         row = conn.execute("""
             SELECT due_date,
-                   CAST(julianday(return_date) - julianday(due_date) AS integer)
-                       AS days_overdue
+                   CAST(julianday(return_date) - julianday(due_date) AS integer) AS days_overdue
               FROM """ + _LOANS + """
              WHERE loan_id = ?
         """, (loan_id,)).fetchone()
 
-        fine = None
+        fine = 0
         if row["days_overdue"] > 0:
             conn.execute(
                 "INSERT INTO Fine (loan_id, assessed_date) VALUES (?, ?)",
@@ -147,7 +127,7 @@ def donate_item(conn, member_id, title, type_code, creator=None,
     who gave it, so the donation needs no stand-in row elsewhere.  It is
     catalogued as a new item, so its copy is always copy 1, and both inserts are
     one transaction -- a failure leaves nothing behind."""
-    donated_date = donated_date or _today()
+    donated_date = donated_date or today()
 
     if conn.execute("SELECT 1 FROM ItemType WHERE type_code = ?",
                     (type_code,)).fetchone() is None:
@@ -198,7 +178,7 @@ def find_events(conn, keyword=None, upcoming_only=True):
 def register_for_event(conn, member_id, event_id, registration_date=None):
     """Register a member.  BR11 (not suspended) and BR18 (capacity) are trigger
     rules; BR17 (at most once) is the composite primary key."""
-    registration_date = registration_date or _today()
+    registration_date = registration_date or today()
     with conn:
         conn.execute("""
             INSERT INTO Registration (member_id, event_id, registration_date)
@@ -291,7 +271,13 @@ def _ask(prompt, cast=str, optional=False):
         if optional:
             return None
         raise LibraryError("A value is required.")
-    return cast(raw)
+    try:
+        return cast(raw)
+    except ValueError:
+        # int is the only cast here that can fail, and main() handles just
+        # LibraryError and sqlite3.Error, so a bare ValueError would end the
+        # session on a typo instead of going back to the menu.
+        raise LibraryError("'%s' is not a whole number." % raw)
 
 
 def _do_find_item(conn):
@@ -320,7 +306,7 @@ def _do_return(conn):
         raise LibraryError("Member %s has nothing on loan." % member_id)
     _show(loans, ["loan_id", "title", "checkout_date", "due_date", "days_overdue"])
     loan_id = _ask("  Loan id to return: ", int)
-    due, overdue, fine = return_item(conn, loan_id)
+    due, overdue, fine = return_item(conn, loan_id, member_id=member_id)
     if fine is None:
         print("  Returned on time (due %s).  No fine." % due)
     else:
