@@ -9,14 +9,9 @@ help.
 opens the menu.  The database must already exist -- run `python library.py`
 first; this module never creates schema.
 
-Three of the eight operations have no table behind them -- the report's section
-1.2 never describes donations, volunteering, or help requests -- so they are
-mapped onto the existing schema.  The mappings are lossy, and knowingly so:
-
-  * donate_item()   inserts Item + Copy and records the donor as a WishlistItem
-                    row (status 'acquired', requested_by = the member).  A wish
-                    list entry is meant to be material the library *may* acquire
-                    later, so the row is being used against its stated meaning.
+Two of the eight operations have no table behind them -- the report's section
+1.2 never describes volunteering or help requests -- so they are mapped onto the
+existing schema.  The mappings are lossy, and knowingly so:
 
   * volunteer()     inserts an Employee row with job_title 'Volunteer - <role>'
                     and salary 0.  Consequences: staff counts, payroll sums and
@@ -175,18 +170,17 @@ def return_item(conn, loan_id, return_date=None):
 
 def donate_item(conn, member_id, title, type_code, creator=None,
                 published_year=None, language=None, donated_date=None):
-    """Accept a donated item.  Returns (item_id, copy_number, request_id).
+    """Accept a donated item.  Returns (item_id, copy_number).
 
-    See the module docstring: the schema has no Donation relation, so this
-    creates the Item and its first Copy and records the donor as a WishlistItem
-    row.  All three inserts are one transaction -- a failure leaves nothing.
+    Copy.acquisition_method and Copy.donated_by record how the copy arrived and
+    who gave it, so the donation needs no stand-in row elsewhere.  Both inserts
+    are one transaction -- a failure leaves nothing.
     """
     donated_date = donated_date or _today()
 
-    fmt = conn.execute(
-        "SELECT type_name FROM ItemType WHERE type_code = ?",
-        (type_code,)).fetchone()
-    if fmt is None:
+    known = conn.execute(
+        "SELECT 1 FROM ItemType WHERE type_code = ?", (type_code,)).fetchone()
+    if known is None:
         raise LibraryError(
             "There is no item type '%s'.  Known types: %s" %
             (type_code, ", ".join(r["type_code"] for r in
@@ -200,19 +194,12 @@ def donate_item(conn, member_id, title, type_code, creator=None,
         item_id = cur.lastrowid
 
         conn.execute("""
-            INSERT INTO Copy (item_id, copy_number, acquisition_date, copy_status)
-            VALUES (?, 1, ?, 'available')
-        """, (item_id, donated_date))
+            INSERT INTO Copy (item_id, copy_number, acquisition_date,
+                              acquisition_method, donated_by, copy_status)
+            VALUES (?, 1, ?, 'donation', ?, 'available')
+        """, (item_id, donated_date, member_id))
 
-        cur = conn.execute("""
-            INSERT INTO WishlistItem (proposed_title, proposed_creator,
-                                      proposed_format, cost, requested_date,
-                                      status, requested_by)
-            VALUES (?, ?, ?, 0, ?, 'acquired', ?)
-        """, (title, creator, fmt["type_name"], donated_date, member_id))
-        request_id = cur.lastrowid
-
-    return item_id, 1, request_id
+    return item_id, 1
 
 
 # ---------------------------------------------------------------------------
@@ -400,10 +387,10 @@ def _do_donate(conn):
     creator = _ask("  Creator (optional): ", optional=True)
     year = _ask("  Published year (optional): ", int, optional=True)
     language = _ask("  Language (optional): ", optional=True)
-    item_id, copy_number, request_id = donate_item(
+    item_id, copy_number = donate_item(
         conn, member_id, title, type_code, creator, year, language)
-    print("  Thank you.  Catalogued as item %s copy %s (donation record %s)."
-          % (item_id, copy_number, request_id))
+    print("  Thank you.  Catalogued as item %s copy %s, recorded as your donation."
+          % (item_id, copy_number))
 
 
 def _do_find_event(conn):

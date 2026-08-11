@@ -1,7 +1,7 @@
 """Library database set-up -- CMPT 354 mini project.
 
 Builds the database the application runs on: the twelve relations of section 3.5
-as SCHEMA_SQL, the seventeen triggers enforcing the business rules of section 1.3
+as SCHEMA_SQL, the sixteen triggers enforcing the business rules of section 1.3
 as TRIGGERS_SQL, and the seed data as DATA_SQL.
 
     python library.py
@@ -56,7 +56,7 @@ CREATE TABLE PostalArea (
 
 
 CREATE TABLE Member (
-    member_id   integer NOT NULL UNIQUE,
+    member_id   integer NOT NULL,
     first_name  text    NOT NULL,
     last_name   text    NOT NULL,
     email       text    NOT NULL UNIQUE,
@@ -98,10 +98,17 @@ CREATE TABLE Copy (
     copy_number      integer NOT NULL
         CONSTRAINT copyNumberCheck CHECK (copy_number > 0),
     acquisition_date date    NOT NULL,
+    acquisition_method text  NOT NULL DEFAULT 'purchase'
+        CONSTRAINT acquisitionMethodCheck CHECK (acquisition_method IN ('purchase', 'donation', 'transfer')),
+    donated_by       integer,
     copy_status      text    NOT NULL DEFAULT 'available'
         CONSTRAINT copyStatusCheck CHECK (copy_status IN ('available', 'loaned', 'lost')),
     PRIMARY KEY (item_id, copy_number),
-    FOREIGN KEY (item_id) REFERENCES Item(item_id) ON DELETE CASCADE
+    CONSTRAINT donorValidityCheck CHECK (
+        (acquisition_method =  'donation' AND donated_by IS NOT NULL) OR
+        (acquisition_method <> 'donation' AND donated_by IS NULL)),
+    FOREIGN KEY (item_id) REFERENCES Item(item_id) ON DELETE CASCADE,
+    FOREIGN KEY (donated_by) REFERENCES Member(member_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE Loan (
@@ -139,14 +146,12 @@ CREATE TABLE Room (
 );
 
 CREATE TABLE Employee (
-    employee_id   integer NOT NULL UNIQUE,
+    employee_id   integer NOT NULL,
     first_name    text    NOT NULL,
     last_name     text    NOT NULL,
     job_title     text    NOT NULL,
-
     salary        decimal(10,2) NOT NULL
         CONSTRAINT salaryCheck CHECK (salary >= 0),
-
     phone         varchar(12) NOT NULL,
     -- Nullable on purpose: BR19 gives the head librarian no supervisor, and
     -- NULL here is what marks that one row.  A NOT NULL column would make the
@@ -171,9 +176,8 @@ CREATE TABLE Event (
     max_attendees     integer NOT NULL
         CONSTRAINT maxAttendeesCheck CHECK (max_attendees > 0),
     room_number       integer NOT NULL,
-    employee_id       integer NOT NULL UNIQUE,
+    employee_id       integer NOT NULL,
     PRIMARY KEY (event_id),
-    CONSTRAINT uniqueRoomStart UNIQUE (room_number, start_datetime),
     CONSTRAINT eventTimesCheck CHECK (end_datetime > start_datetime),
     FOREIGN KEY (room_number) REFERENCES Room(room_number) ON DELETE RESTRICT,
     FOREIGN KEY (employee_id) REFERENCES Employee(employee_id) ON DELETE RESTRICT
@@ -228,15 +232,6 @@ WHEN (SELECT count(*) FROM Loan
       WHERE member_id = NEW.member_id AND return_date IS NULL) >= 5
 BEGIN
     SELECT RAISE(ABORT, 'BR10: a member may have at most five items on loan at once');
-END;
-
-CREATE TRIGGER CopyAlreadyLoaned
-BEFORE INSERT ON Loan
-FOR EACH ROW
-WHEN EXISTS (SELECT * FROM Loan
-             WHERE item_id = NEW.item_id AND copy_number = NEW.copy_number AND return_date IS NULL)
-BEGIN
-    SELECT RAISE(ABORT, 'BR6: A copy is on loan at the moment');
 END;
 
 CREATE TRIGGER CopyNotAvailable
@@ -366,21 +361,6 @@ WHEN NEW.supervisor_id IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'BR19: every employee must report to exactly one supervisor');
 END;
-
-CREATE TRIGGER NoSelfSupervision
-BEFORE UPDATE OF supervisor_id ON Employee
-FOR EACH ROW
-WHEN NEW.supervisor_id IS NOT NULL
-     AND EXISTS (WITH RECURSIVE chain(id) AS (
-                     SELECT NEW.supervisor_id
-                     UNION
-                     SELECT e.supervisor_id FROM Employee e
-                     JOIN chain c ON e.employee_id = c.id
-                     WHERE e.supervisor_id IS NOT NULL)
-                 SELECT * FROM chain WHERE id = NEW.employee_id)
-BEGIN
-    SELECT RAISE(ABORT, 'BR19: an employee may not end up supervising themselves');
-END;
 """
 
 
@@ -434,11 +414,9 @@ def load_data(db_name=DB_NAME):
 
 
 if __name__ == "__main__":
+    init_db()
+    load_data()
     with closing(connect()) as conn:
-        conn.executescript(SCHEMA_SQL)
-        conn.executescript(TRIGGERS_SQL)
-        conn.executescript(DATA_SQL)
-        conn.commit()
         counts = dict(conn.execute(
             "SELECT type, count(*) FROM sqlite_master "
             " WHERE type IN ('table', 'trigger') GROUP BY type"))
